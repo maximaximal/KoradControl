@@ -284,7 +284,6 @@ class KA3005P
   {
     queryStatus([this, cb](const std::string& status) {
       assert(status.size() == 1);
-      std::bitset<8> statusBitset(status[0]);
       const Status statusStruct = *reinterpret_cast<const Status*>(&status[0]);
       m_status = statusStruct;
       cb(statusStruct);
@@ -449,7 +448,6 @@ class KA3005P
         cancelWriteTimeout();
         if(verbose) {
           std::cerr << "--> " << req->query << std::endl;
-          ;
         }
 
         if(ec) {
@@ -587,6 +585,7 @@ class App
 
     m_targetVoltage = vm["volt"].as<int>();
     m_targetCurrent = vm["current"].as<int>();
+    m_pollInterval = vm["poll-interval"].as<int>();
 
     m_signals.async_wait(std::bind(
       &App::signalHandler, this, std::placeholders::_1, std::placeholders::_2));
@@ -608,7 +607,7 @@ class App
   template<typename CB>
   void waitForMilliseconds(int ms, CB cb)
   {
-    m_waitTimer.expires_from_now(boost::posix_time::milliseconds(ms));
+    m_waitTimer.expires_from_now(std::chrono::milliseconds(ms));
     m_waitTimer.async_wait(cb);
   }
 
@@ -625,7 +624,7 @@ class App
 
       printCSVHeader();
 
-      for(; !m_exit;) {
+      while(!m_exit) {
         yield this->waitForMilliseconds(m_pollInterval, s);
 
         yield m_psu->updateOutputCurrent(s);
@@ -646,7 +645,8 @@ class App
     reenter(m_stopCoro)
     {
       if(m_psu) {
-        yield m_psu->turnOutputOff(s);
+        m_psu->turnOutputOff(s);
+        yield this->waitForMilliseconds(1000, s);
       }
       m_ioService.stop();
     }
@@ -694,7 +694,7 @@ class App
 
   int m_targetVoltage;// in mV
   int m_targetCurrent;// in mA
-  int m_pollInterval;
+  int m_pollInterval = 1000;
 
   as::coroutine m_appCoro;
   as::coroutine m_stopCoro;
@@ -703,7 +703,7 @@ class App
 
   std::chrono::steady_clock::time_point m_startTime =
     std::chrono::steady_clock::now();
-  as::deadline_timer m_waitTimer;
+  as::steady_timer m_waitTimer;
 };
 
 int
