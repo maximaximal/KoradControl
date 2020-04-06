@@ -28,49 +28,124 @@ namespace po = boost::program_options;
 
 #define SET_VOLTAGE "VSET1:"
 #define SET_CURRENT "ISET1:"
-#define SET_OUTPUT "OUT"
+#define SET_OUTPUT_ON "OUT1"
+#define SET_OUTPUT_OFF "OUT0"
 #define SET_OVP "OVP"// Over Voltage Protection
 #define SET_OCP "OCP"// Over Current Protection
 
-#define TIMEOUT 7
+#define TIMEOUT_WRITE 1000
+#define TIMEOUT_READSOME 100
+
+static bool verbose = false;
 
 /* Callback functions for results */
+struct Status
+{
+  Status()
+    : _padding1(false)
+    , cv_cc(false)
+    , ovp_ocp(false)
+    , out(false)
+    , _padding2(false)
+  {}
+  bool _padding1 : 4;
+  bool cv_cc : 1;
+  bool ovp_ocp : 1;
+  bool out : 1;
+  bool _padding2 : 1;
+};
+
+std::ostream&
+operator<<(std::ostream& o, const Status& s)
+{
+  return o << "("
+           << "CV/CC=" << s.cv_cc << ",OVP/OCP=" << s.ovp_ocp
+           << ",OUT=" << s.out << ")";
+}
+
 using IntCB = std::function<void(int)>;
 using StrCB = std::function<void(const std::string&)>;
+using StatusCB = std::function<void(Status)>;
+using EmptyCB = std::function<void()>;
 
 class Request
 {
   public:
   explicit Request(const std::string& query, size_t responseLen)
     : query(query)
-    , responseLen(responseLen)
+    , expectedRespnseLen(responseLen)
   {}
+  virtual ~Request() {}
 
-  virtual void parseResponse(const std::string& resp)
+  virtual void parseResponse(std::string resp)
   {
     std::cerr << "Response ignored." << std::endl;
   }
 
+  void receiveBytes(const char* data, size_t bytes)
+  {
+    std::copy(data, data + bytes, std::back_inserter(m_response));
+  }
+
+  bool readFinished()
+  {
+    if(m_response.size() == expectedRespnseLen) {
+      auto resp = responseAsString();
+      if(verbose) {
+        std::cerr << "    <-- " << resp << std::endl;
+      }
+      parseResponse(resp);
+      return true;
+    } else {
+      m_response.clear();
+      return false;
+    }
+  }
+
+  std::string responseAsString()
+  {
+    return std::string(m_response.begin(), m_response.end());
+  }
+
   const std::string query;
-  const size_t responseLen;
+  const size_t expectedRespnseLen;
+
+  private:
+  std::vector<char> m_response;
 };
 
-class IntRequest : public Request
+class VIntRequest : public Request
 {
   public:
-  explicit IntRequest(const std::string& query, size_t responseLen, IntCB cb)
+  explicit VIntRequest(const std::string& query, size_t responseLen, IntCB cb)
     : Request(query, responseLen)
     , cb(cb)
   {}
 
-  virtual void parseResponse(const std::string& resp)
+  virtual void parseResponse(std::string resp) override
   {
-    std::cerr << "Response: \"" << resp << "\"" << std::endl;
-    if(resp == "") {
-      cb(0);
-    } else {
-      std::cerr << resp << std::endl;
-    }
+    assert(resp.find('.') == 2);
+    resp.erase(2, 1);
+    int voltage = std::atoi(resp.c_str()) * 10;
+    cb(voltage);
+  }
+
+  IntCB cb;
+};
+
+class IIntRequest : public Request
+{
+  public:
+  explicit IIntRequest(const std::string& query, size_t responseLen, IntCB cb)
+    : Request(query, responseLen)
+    , cb(cb)
+  {}
+
+  virtual void parseResponse(std::string resp) override
+  {
+    resp.erase(resp.find('.'), 1);
+    int current = std::atoi(resp.c_str());
+    cb(current);
   }
 
   IntCB cb;
@@ -84,11 +159,7 @@ class StrRequest : public Request
     , cb(cb)
   {}
 
-  virtual void parseResponse(const std::string& resp)
-  {
-    std::cerr << "Response: \"" << resp << "\"" << std::endl;
-    cb(resp);
-  }
+  virtual void parseResponse(std::string resp) override { cb(resp); }
 
   StrCB cb;
 };
@@ -98,10 +169,10 @@ class KA3005P
 {
   public:
   explicit KA3005P(as::io_service& ioService, const std::string& serialPortPath)
-    : m_ioService(ioService)
-    , m_serialPortPath(serialPortPath)
+    : m_serialPortPath(serialPortPath)
     , m_serialPort(ioService)
-    , m_deadlineTimer(ioService)
+    , m_readTimer(ioService)
+    , m_writeTimer(ioService)
   {}
 
   void open()
@@ -119,63 +190,171 @@ class KA3005P
       m_serialPort.set_option(
         as::serial_port_base::parity(as::serial_port_base::parity::none));
       m_serialPort.set_option(as::serial_port_base::flow_control(
-        as::serial_port_base::flow_control::none));
+        as::serial_port_base::flow_control::hardware));
 
-      // char buf[2] = "\n";
-      // as::write(m_serialPort, as::const_buffer(buf, 1));
+      // m_deadlineTimer.expires_from_now(boost::posix_time::milliseconds(300));
+      // m_deadlineTimer.wait();
 
-      m_deadlineTimer.expires_from_now(boost::posix_time::milliseconds(300));
-      m_deadlineTimer.wait();
+      readSome();
     } catch(const boost::system::system_error& e) {
       std::cerr << "Could not init serial port! Encountered error: " << e.what()
                 << ". Terminating program." << std::endl;
-      exit(EXIT_FAILURE);
+      ::exit(EXIT_FAILURE);
     }
   }
 
-  void init()
+  void init() { open(); }
+
+  void startReadTimeout()
   {
-    open();
-
-    queryID([this](const std::string&) {
-      queryStatus([this](const std::string&) {
-        queryOutV([this](int i) {
-
-        });
-      });
-    });
+    m_readTimer.expires_from_now(
+      boost::posix_time::milliseconds(TIMEOUT_READSOME));
+    m_readTimer.async_wait(
+      std::bind(&KA3005P::readTimeout, this, std::placeholders::_1));
   }
 
-  void startTimeout()
+  void startWriteTimeout()
   {
-    m_deadlineTimer.expires_from_now(boost::posix_time::seconds(TIMEOUT));
-    m_deadlineTimer.async_wait(
-      std::bind(&KA3005P::stop, this, std::placeholders::_1));
+    m_writeTimer.expires_from_now(
+      boost::posix_time::milliseconds(TIMEOUT_WRITE));
+    m_writeTimer.async_wait(std::bind(
+      &KA3005P::stop, this, std::placeholders::_1, TIMEOUT_WRITE, "write"));
   }
 
-  void cancelTimeout() { m_deadlineTimer.cancel(); }
+  void cancelReadTimeout() { m_readTimer.cancel(); }
+  void cancelWriteTimeout() { m_writeTimer.cancel(); }
 
-  void stop(const boost::system::error_code& ec)
+  void stop(const boost::system::error_code& ec,
+            int timeout,
+            const std::string& message)
   {
     if(ec == boost::asio::error::operation_aborted) {
       return;
     }
-    std::cerr << "Timeout of " << TIMEOUT
+    std::cerr << "Timeout for " << message << " of " << timeout
               << " seconds expired! Terminating program." << std::endl;
-    exit(EXIT_FAILURE);
+    ::exit(EXIT_FAILURE);
+  }
+
+  void readSome()
+  {
+    m_serialPort.async_read_some(
+      as::mutable_buffer(m_readBuffer.data(), m_readBuffer.size()),
+      std::bind(&KA3005P::readHandler,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2));
+    startReadTimeout();
+  }
+
+  void readTimeout(const boost::system::error_code& ec)
+  {
+    if(ec == boost::asio::error::operation_aborted) {
+      return;
+    }
+
+    if(m_request) {
+      auto req = m_request;
+      m_request.reset();
+      if(!req->readFinished()) {
+        execRequestResponse(req);
+      }
+    }
+
+    readSome();
+  }
+
+  void readHandler(const boost::system::error_code& ec, size_t bytes)
+  {
+    cancelReadTimeout();
+
+    if(ec) {
+      std::cerr << "Error during read! Error: " << ec.message() << std::endl;
+    } else {
+
+      if(m_request) {
+        m_request->receiveBytes(m_readBuffer.data(), bytes);
+      }
+    }
+
+    readSome();
+  }
+
+  void updateStatus(StatusCB cb)
+  {
+    queryStatus([this, cb](const std::string& status) {
+      assert(status.size() == 1);
+      std::bitset<8> statusBitset(status[0]);
+      const Status statusStruct = *reinterpret_cast<const Status*>(&status[0]);
+      m_status = statusStruct;
+      cb(statusStruct);
+    });
+  }
+
+  void updateOutputCurrent(IntCB cb)
+  {
+    queryOutI([this, cb](int current) {
+      m_outputCurrent = current;
+      cb(current);
+    });
+  }
+
+  void updateOutputVoltage(IntCB cb)
+  {
+    queryOutV([this, cb](int voltage) {
+      m_outputVoltage = voltage;
+      cb(voltage);
+    });
+  }
+
+  void updateSetCurrent(IntCB cb)
+  {
+    querySetI([this, cb](int current) {
+      m_setCurrent = current;
+      cb(current);
+    });
+  }
+
+  void updateSetVoltage(IntCB cb)
+  {
+    querySetV([this, cb](int voltage) {
+      m_setVoltage = voltage;
+      cb(voltage);
+    });
   }
 
   void queryOutV(IntCB cb)
   {
-    std::unique_ptr<IntRequest> req =
-      std::make_unique<IntRequest>(REQUEST_ACTUAL_VOLTAGE, 2, cb);
+    std::unique_ptr<VIntRequest> req =
+      std::make_unique<VIntRequest>(REQUEST_ACTUAL_VOLTAGE, 5, cb);
+    execRequestResponse(std::move(req));
+  }
+
+  void querySetV(IntCB cb)
+  {
+    std::unique_ptr<VIntRequest> req =
+      std::make_unique<VIntRequest>(REQUEST_SET_VOLTAGE, 5, cb);
+    execRequestResponse(std::move(req));
+  }
+
+  void queryOutI(IntCB cb)
+  {
+    std::unique_ptr<IIntRequest> req =
+      std::make_unique<IIntRequest>(REQUEST_ACTUAL_CURRENT, 5, cb);
+    execRequestResponse(std::move(req));
+  }
+
+  void querySetI(IntCB cb)
+  {
+    std::unique_ptr<IIntRequest> req =
+      std::make_unique<IIntRequest>(REQUEST_SET_CURRENT, 6, cb);
     execRequestResponse(std::move(req));
   }
 
   void queryID(StrCB cb)
   {
     std::unique_ptr<StrRequest> req =
-      std::make_unique<StrRequest>(REQUEST_ID, 15, cb);
+      std::make_unique<StrRequest>(REQUEST_ID, 16, cb);
     execRequestResponse(std::move(req));
   }
 
@@ -186,51 +365,105 @@ class KA3005P
     execRequestResponse(std::move(req));
   }
 
+  void sendSetVoltage(StrCB cb)
+  {
+    assert(m_targetVoltage > 0);
+    assert(m_targetVoltage <= 31000);
+    std::string cmd = std::to_string(m_targetVoltage / 10);
+    cmd = std::string(4 - cmd.length(), '0') + cmd;
+    cmd.insert(2, ".");
+    cmd = SET_VOLTAGE + cmd;
+
+    std::unique_ptr<StrRequest> req = std::make_unique<StrRequest>(cmd, 0, cb);
+    this->execRequestResponse(std::move(req));
+  }
+
+  void setVoltage(int mV, EmptyCB cb)
+  {
+    m_setVoltageCoro = as::coroutine();
+    m_targetVoltage = mV;
+    setVoltageInternal(cb);
+  }
+
+#include <boost/asio/yield.hpp>
+  void setVoltageInternal(EmptyCB endCB)
+  {
+    auto s = std::bind(&KA3005P::setVoltageInternal, this, endCB);
+
+    reenter(m_setVoltageCoro)
+    {
+      do {
+        yield this->sendSetVoltage(s);
+        yield this->updateSetVoltage(s);
+      } while(m_setVoltage != m_targetVoltage && !m_exit);
+      endCB();
+    }
+  }
+#include <boost/asio/unyield.hpp>
+
+  void sendSetCurrent(StrCB cb)
+  {
+    assert(m_targetCurrent > 0);
+    assert(m_targetCurrent <= 5100);
+    std::string cmd = std::to_string(m_targetCurrent);
+    cmd = std::string(4 - cmd.length(), '0') + cmd;
+    cmd.insert(1, ".");
+    cmd = SET_CURRENT + cmd;
+
+    std::unique_ptr<StrRequest> req = std::make_unique<StrRequest>(cmd, 0, cb);
+    this->execRequestResponse(std::move(req));
+  }
+
+  void setCurrent(int mA, EmptyCB cb)
+  {
+    m_setCurrentCoro = as::coroutine();
+    m_targetCurrent = mA;
+    setCurrentInternal(cb);
+  }
+
+#include <boost/asio/yield.hpp>
+  void setCurrentInternal(EmptyCB endCB)
+  {
+    auto s = std::bind(&KA3005P::setCurrentInternal, this, endCB);
+
+    reenter(m_setCurrentCoro)
+    {
+      do {
+        yield this->sendSetCurrent(s);
+        yield this->updateSetCurrent(s);
+      } while(m_setCurrent != m_targetCurrent && !m_exit);
+      endCB();
+    }
+  }
+#include <boost/asio/unyield.hpp>
+
   void execRequestResponse(std::shared_ptr<Request> req)
   {
-    m_serialPort.async_read_some(
-      as::mutable_buffer(m_readBuffer.data(), req->responseLen),
-      [this, req](const boost::system::error_code& ec, size_t bytes) mutable {
-        cancelTimeout();
-        std::cerr << "Received Answer to " << req->query << " Bytes: " << bytes
-                  << std::endl;
-        if(ec) {
-          std::cerr << "Error during read! Error: " << ec.message()
-                    << ". Terminating program." << std::endl;
-          exit(EXIT_FAILURE);
-        }
-        m_deadlineTimer.expires_from_now(boost::posix_time::milliseconds(200));
-        m_deadlineTimer.wait();
-        req->parseResponse(
-          std::string(m_readBuffer.begin(), m_readBuffer.begin() + bytes));
-        // flushBuffer();
-      });
+    flushBuffer();
 
-    startTimeout();
-    // flushBuffer();
+    startWriteTimeout();
     as::async_write(
       m_serialPort,
       as::buffer(req->query),
       [this, req](const boost::system::error_code& ec, size_t bytes) mutable {
-        cancelTimeout();
+        cancelWriteTimeout();
+        if(verbose) {
+          std::cerr << "--> " << req->query << std::endl;
+          ;
+        }
+
         if(ec) {
           std::cerr << "Error during write! Error: " << ec.message()
                     << ". Terminating program." << std::endl;
-          exit(EXIT_FAILURE);
+          ::exit(EXIT_FAILURE);
         }
-        std::cerr << "Wrote " << req->query << std::endl;
-        if(req->responseLen == 0) {
-          std::cerr << "Immediate End " << req->query << std::endl;
-          req->parseResponse("");
+        if(req->expectedRespnseLen == 0) {
+          m_writeTimer.expires_from_now(boost::posix_time::milliseconds(200));
+          m_writeTimer.async_wait([req](const boost::system::error_code& ec) {
+            req->parseResponse("");
+          });
         } else {
-          // Wait for 0.015s
-          std::cerr << "Waiting then wait for answer." << req->query
-                    << std::endl;
-          m_deadlineTimer.expires_from_now(boost::posix_time::milliseconds(15));
-          m_deadlineTimer.wait();
-
-          std::cerr << "Waiting for answer." << req->query << std::endl;
-          startTimeout();
+          m_request = req;
         }
       });
   }
@@ -240,13 +473,72 @@ class KA3005P
     ::tcflush(m_serialPort.lowest_layer().native_handle(), TCIOFLUSH);
   }
 
+  const Status& getStatus() { return m_status; }
+  int getOutputVoltage() { return m_outputVoltage; }
+  int getOutputCurrent() { return m_outputCurrent; }
+
+  void executeSetOutput(EmptyCB cb)
+  {
+    std::unique_ptr<StrRequest> req = std::make_unique<StrRequest>(
+      m_targetOutputOn ? SET_OUTPUT_ON : SET_OUTPUT_OFF, 0, std::bind(cb));
+    execRequestResponse(std::move(req));
+  }
+  void turnOutputOn(EmptyCB cb)
+  {
+    m_setOutputCoro = as::coroutine();
+    m_targetOutputOn = true;
+    setOutputInternal(cb);
+  }
+  void turnOutputOff(EmptyCB cb)
+  {
+    m_setOutputCoro = as::coroutine();
+    m_targetOutputOn = false;
+    setOutputInternal(cb);
+  }
+
+#include <boost/asio/yield.hpp>
+  void setOutputInternal(EmptyCB endCB)
+  {
+    auto s = std::bind(&KA3005P::setOutputInternal, this, endCB);
+    reenter(m_setOutputCoro)
+    {
+      do {
+        yield this->executeSetOutput(s);
+        yield this->updateStatus(s);
+      } while(m_status.out != m_targetOutputOn && !m_exit);
+      endCB();
+    }
+  }
+#include <boost/asio/unyield.hpp>
+
+  void exit() { m_exit = true; }
+
   private:
-  as::io_service& m_ioService;
   std::string m_serialPortPath;
 
   as::serial_port m_serialPort;
-  as::deadline_timer m_deadlineTimer;
+  as::deadline_timer m_readTimer;
+  as::deadline_timer m_writeTimer;
   std::array<char, 255> m_readBuffer;
+
+  std::shared_ptr<Request> m_request;
+
+  uint32_t m_outputVoltage = 0;
+  uint32_t m_outputCurrent = 0;
+  uint32_t m_setVoltage = 0;
+  uint32_t m_setCurrent = 0;
+
+  uint32_t m_targetVoltage = 0;
+  uint32_t m_targetCurrent = 0;
+
+  bool m_targetOutputOn = false;
+
+  as::coroutine m_setVoltageCoro;
+  as::coroutine m_setCurrentCoro;
+  as::coroutine m_setOutputCoro;
+
+  Status m_status = Status();
+  bool m_exit = false;
 };
 
 using PSU = KA3005P;
@@ -256,6 +548,7 @@ class App
   public:
   App()
     : m_signals(m_ioService, SIGINT)
+    , m_waitTimer(m_ioService)
   {}
 
   int run(int argc, char* argv[])
@@ -270,6 +563,10 @@ class App
         ("device", po::value<std::string>()->default_value("/dev/ttyACM0"), "serial port to power supply")
         ("volt", po::value<int>()->default_value(5000), "(targeted) output voltage [mV]")
         ("current", po::value<int>()->default_value(1500), "(targeted) output current [mA]")
+
+        ("poll-interval", po::value<int>()->default_value(1000), "time to wait between polls of current and voltage [ms]")
+
+        ("verbose,v", po::bool_switch(&verbose), "verbose output of messages")
     ;
     // clang-format on
 
@@ -303,11 +600,59 @@ class App
   {
     m_psu = std::make_unique<PSU>(m_ioService, m_device);
     m_ioService.post(std::bind(&PSU::init, m_psu.get()));
+    m_ioService.post(std::bind(&App::step, this));
 
     m_ioService.run();
   }
 
-  void stop() { m_ioService.stop(); }
+  template<typename CB>
+  void waitForMilliseconds(int ms, CB cb)
+  {
+    m_waitTimer.expires_from_now(boost::posix_time::milliseconds(ms));
+    m_waitTimer.async_wait(cb);
+  }
+
+#include <boost/asio/yield.hpp>
+
+  void step()
+  {
+    auto s = std::bind(&App::step, this);
+    reenter(m_appCoro)
+    {
+      yield m_psu->setVoltage(m_targetVoltage, s);
+      yield m_psu->setCurrent(m_targetCurrent, s);
+      yield m_psu->turnOutputOn(s);
+
+      printCSVHeader();
+
+      for(; !m_exit;) {
+        yield this->waitForMilliseconds(m_pollInterval, s);
+
+        yield m_psu->updateOutputCurrent(s);
+        yield m_psu->updateOutputVoltage(s);
+
+        printCSVLine();
+      }
+
+      yield m_psu->turnOutputOff(s);
+      m_psu->exit();
+    }
+  }
+
+  void stop()
+  {
+    auto s = std::bind(&App::stop, this);
+
+    reenter(m_stopCoro)
+    {
+      if(m_psu) {
+        yield m_psu->turnOutputOff(s);
+      }
+      m_ioService.stop();
+    }
+  }
+
+#include <boost/asio/unyield.hpp>
 
   void signalHandler(const boost::system::error_code& ec, int signalNumber)
   {
@@ -318,8 +663,25 @@ class App
     }
     if(signalNumber == SIGINT) {
       std::cerr << "SIGINT captured. Turning off PSU." << std::endl;
+      if(m_psu) {
+        m_exit = true;
+        step();
+      }
       stop();
     }
+  }
+
+  void printCSVHeader()
+  {
+    std::cout << "MS_SINCE_START;OUTPUT_VOLTAGE;OUTPUT_CURRENT" << std::endl;
+  }
+  void printCSVLine()
+  {
+    std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - m_startTime)
+                   .count()
+              << ";" << m_psu->getOutputVoltage() << ";"
+              << m_psu->getOutputCurrent() << std::endl;
   }
 
   private:
@@ -332,6 +694,16 @@ class App
 
   int m_targetVoltage;// in mV
   int m_targetCurrent;// in mA
+  int m_pollInterval;
+
+  as::coroutine m_appCoro;
+  as::coroutine m_stopCoro;
+
+  bool m_exit = false;
+
+  std::chrono::steady_clock::time_point m_startTime =
+    std::chrono::steady_clock::now();
+  as::deadline_timer m_waitTimer;
 };
 
 int
