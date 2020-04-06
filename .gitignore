@@ -153,3 +153,7 @@ tags
 # End of https://www.gitignore.io/api/c,vim,c++,emacs
 koradcontrol
 compile_commands.json
+
+*.log
+out/
+log/
