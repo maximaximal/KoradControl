@@ -562,7 +562,7 @@ class App
         ("volt", po::value<int>()->default_value(5000), "(targeted) output voltage [mV]")
         ("current", po::value<int>()->default_value(1500), "(targeted) output current [mA]")
 
-        ("poll-interval", po::value<int>()->default_value(1000), "time to wait between polls of current and voltage [ms]")
+        ("poll-interval", po::value<int>()->default_value(100), "time to wait between polls of current and voltage [ms]")
 
         ("verbose,v", po::bool_switch(&verbose), "verbose output of messages")
     ;
