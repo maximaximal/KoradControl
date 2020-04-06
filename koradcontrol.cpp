@@ -34,7 +34,7 @@ namespace po = boost::program_options;
 #define SET_OCP "OCP"// Over Current Protection
 
 #define TIMEOUT_WRITE 1000
-#define TIMEOUT_READSOME 100
+#define TIMEOUT_READSOME 35
 
 static bool verbose = false;
 
