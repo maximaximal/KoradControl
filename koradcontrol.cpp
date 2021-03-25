@@ -33,8 +33,13 @@ namespace po = boost::program_options;
 #define SET_OVP "OVP"// Over Voltage Protection
 #define SET_OCP "OCP"// Over Current Protection
 
+#ifdef __FreeBSD__
+#define TIMEOUT_WRITE 1000
+#define TIMEOUT_READSOME 90
+#else
 #define TIMEOUT_WRITE 1000
 #define TIMEOUT_READSOME 35
+#endif
 
 static bool verbose = false;
 
@@ -189,8 +194,11 @@ class KA3005P
         as::serial_port_base::stop_bits(as::serial_port_base::stop_bits::one));
       m_serialPort.set_option(
         as::serial_port_base::parity(as::serial_port_base::parity::none));
+
+#ifndef __FreeBSD__
       m_serialPort.set_option(as::serial_port_base::flow_control(
         as::serial_port_base::flow_control::hardware));
+#endif
 
       // m_deadlineTimer.expires_from_now(boost::posix_time::milliseconds(300));
       // m_deadlineTimer.wait();
@@ -456,7 +464,7 @@ class KA3005P
           ::exit(EXIT_FAILURE);
         }
         if(req->expectedRespnseLen == 0) {
-          m_writeTimer.expires_from_now(boost::posix_time::milliseconds(200));
+          m_writeTimer.expires_from_now(boost::posix_time::milliseconds(400));
           m_writeTimer.async_wait([req](const boost::system::error_code& ec) {
             req->parseResponse("");
           });
